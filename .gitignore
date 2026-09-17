@@ -12,8 +12,10 @@ env/
 *.env
 !.env.example
 
-# Exported receipt data
+# Exported receipt data (personal data — never commit)
 nalog_receipts_export/
+nalog_receipts_export*/
+fns-receipts*/
 *.csv
 *.json
 
