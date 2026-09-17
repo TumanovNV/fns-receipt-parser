@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Local secrets
+.env
+*.env
+!.env.example
+
+# Exported receipt data
+nalog_receipts_export/
+*.csv
+*.json
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
