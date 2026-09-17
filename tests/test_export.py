@@ -176,6 +176,33 @@ class RunTest(unittest.TestCase):
         self.assertIn("истёк", err)
         self.assertEqual(list(self.out_dir.iterdir()), [])
 
+    def test_period_without_receipts_creates_empty_export(self):
+        from tests.test_api import FakeResponse
+        self.urlopen.side_effect = [FakeResponse({"receipts": [], "hasMore": False})]
+        code, out, err = self.run_main(["--output-dir", str(self.out_dir),
+                                        "--date-from", "2026-09-01",
+                                        "--date-to", "2026-09-17"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Найдено чеков: 0", out)
+        self.assertEqual(self.urlopen.call_count, 1)
+        self.assertEqual(
+            json.loads((self.out_dir / "receipts_full.json").read_text(encoding="utf-8")), [])
+        _, summary_rows = read_csv(self.out_dir / "receipts_summary.csv")
+        _, item_rows = read_csv(self.out_dir / "receipt_items.csv")
+        self.assertEqual((summary_rows, item_rows), ([], []))
+        self.assertTrue((self.out_dir / "receipts_summary.csv").read_bytes()
+                        .startswith(b"\xef\xbb\xbf" + ";".join(exporter.SUMMARY_FIELDS).encode()))
+        self.assertFalse((self.out_dir / "errors.json").exists())
+
+    def test_422_on_list_fails_with_instructions_and_writes_nothing(self):
+        from tests.test_api import http_error
+        self.urlopen.side_effect = http_error(422)
+        code, _, err = self.run_main(["--output-dir", str(self.out_dir)])
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 422", err)
+        self.assertIn("lkdr.nalog.ru", err)
+        self.assertEqual(list(self.out_dir.iterdir()), [])
+
     def test_empty_token_exits_without_api_calls(self):
         with mock.patch.dict(exporter.os.environ, {"FNS_TOKEN": ""}), \
                 mock.patch.object(exporter.getpass, "getpass", return_value="  "):

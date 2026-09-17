@@ -194,6 +194,23 @@ class GetReceiptsTest(ApiTestCase):
         self.assertTrue(all(p["dateFrom"] == "2026-09-01" for p in payloads))
         self.assertTrue(all(p["dateTo"] == "2026-09-17" for p in payloads))
 
+    def test_has_more_false_stops_without_extra_request(self):
+        page = receipts_page(0, 10)
+        page["hasMore"] = False
+        self.urlopen.side_effect = [FakeResponse(page)]
+        self.assertEqual(len(exporter.get_receipts(TOKEN)), 10)
+        self.assertEqual(self.urlopen.call_count, 1)
+
+    def test_offset_advances_by_received_count(self):
+        # Defensive: if the service ignored limit and returned more receipts.
+        self.urlopen.side_effect = [
+            FakeResponse(receipts_page(0, 12)),
+            FakeResponse(receipts_page(12, 3)),
+        ]
+        receipts = exporter.get_receipts(TOKEN)
+        self.assertEqual([r["key"] for r in receipts], [f"k{i}" for i in range(15)])
+        self.assertEqual([p["offset"] for p in self.sent_payloads()], [0, 12])
+
     def test_exactly_full_last_page_requests_one_empty_page(self):
         self.urlopen.side_effect = [
             FakeResponse(receipts_page(0, 10)),
@@ -203,15 +220,10 @@ class GetReceiptsTest(ApiTestCase):
         self.assertEqual(len(receipts), 10)
         self.assertEqual([p["offset"] for p in self.sent_payloads()], [0, 10])
 
-    def test_custom_page_size(self):
-        self.urlopen.side_effect = [
-            FakeResponse(receipts_page(0, 25)),
-            FakeResponse(receipts_page(25, 4)),
-        ]
-        receipts = exporter.get_receipts(TOKEN, limit=25)
-        self.assertEqual(len(receipts), 29)
-        self.assertEqual([(p["limit"], p["offset"]) for p in self.sent_payloads()],
-                         [(25, 0), (25, 25)])
+    def test_empty_first_page_is_an_empty_result(self):
+        self.urlopen.side_effect = [FakeResponse({"receipts": [], "hasMore": False})]
+        self.assertEqual(exporter.get_receipts(TOKEN, "2026-09-01", "2026-09-17"), [])
+        self.assertEqual(self.urlopen.call_count, 1)
 
     def test_repeated_page_stops_instead_of_looping_forever(self):
         self.urlopen.side_effect = lambda *a, **kw: FakeResponse(receipts_page(0, 10))
@@ -223,27 +235,6 @@ class GetReceiptsTest(ApiTestCase):
         self.urlopen.side_effect = lambda *a, **kw: FakeResponse({"receipts": [{}] * 10})
         receipts = exporter.get_receipts(TOKEN)
         self.assertEqual(len(receipts), 10)
-        self.assertEqual(self.urlopen.call_count, 2)
-
-    def test_server_capped_page_size_does_not_lose_receipts(self):
-        # --page-size 100 requested, but the service returns at most 50 per page.
-        self.urlopen.side_effect = [
-            FakeResponse(receipts_page(0, 50)),
-            FakeResponse(receipts_page(50, 50)),
-            FakeResponse(receipts_page(100, 30)),
-            FakeResponse({"receipts": []}),
-        ]
-        receipts = exporter.get_receipts(TOKEN, limit=100)
-        self.assertEqual(len(receipts), 130)
-        self.assertEqual([p["offset"] for p in self.sent_payloads()], [0, 50, 100, 130])
-
-    def test_small_page_size_stops_on_short_page(self):
-        self.urlopen.side_effect = [
-            FakeResponse(receipts_page(0, 5)),
-            FakeResponse(receipts_page(5, 2)),
-        ]
-        receipts = exporter.get_receipts(TOKEN, limit=5)
-        self.assertEqual(len(receipts), 7)
         self.assertEqual(self.urlopen.call_count, 2)
 
     def test_unexpected_response_raises(self):
@@ -259,16 +250,37 @@ class GetReceiptsTest(ApiTestCase):
             exporter.get_receipts(TOKEN)
         self.assertEqual(ctx.exception.status, 401)
 
-    def test_422_after_first_page_ends_list_like_web_app(self):
-        self.urlopen.side_effect = [FakeResponse(receipts_page(0, 10)), http_error(422)]
-        receipts = exporter.get_receipts(TOKEN)
-        self.assertEqual(len(receipts), 10)
-
+    # lkdr.nalog.ru web app: 422 from /v1/receipt is re-thrown and opens the
+    # "Настройки отображения данных" dialog; it is not an empty list.
     def test_422_on_first_page_is_an_error(self):
         self.urlopen.side_effect = [http_error(422)]
         with self.assertRaises(exporter.ApiError) as ctx:
             exporter.get_receipts(TOKEN)
         self.assertEqual(ctx.exception.status, 422)
+        self.assertIn("Настройки отображения данных", str(ctx.exception))
+        self.assertEqual(self.urlopen.call_count, 1)  # not retried
+
+    def test_422_after_first_page_is_an_error_too(self):
+        self.urlopen.side_effect = [FakeResponse(receipts_page(0, 10)), http_error(422)]
+        with self.assertRaises(exporter.ApiError) as ctx:
+            exporter.get_receipts(TOKEN)
+        self.assertEqual(ctx.exception.status, 422)
+
+    def test_422_additional_info_is_not_echoed(self):
+        # Synthetic body shaped like the web app expects: code, message and
+        # additionalInfo with a JSON-encoded identifier (phone or email).
+        body = json.dumps({
+            "code": "receipt.expiration.date.required",
+            "message": "choose display settings",
+            "additionalInfo": {"x": '{"login": "+70000000000", "type": "SMS"}'},
+        }).encode()
+        self.urlopen.side_effect = [http_error(422, body)]
+        with self.assertRaises(exporter.ApiError) as ctx:
+            exporter.get_receipts(TOKEN)
+        message = str(ctx.exception)
+        self.assertIn("receipt.expiration.date.required", message)
+        self.assertIn("choose display settings", message)
+        self.assertNotIn("70000000000", message)
 
 
 class ReceiptDetailTest(ApiTestCase):
@@ -293,6 +305,12 @@ class ReceiptDetailTest(ApiTestCase):
         detail, error, entry = exporter.get_receipt_detail(TOKEN, {"key": "abc"})
         self.assertIsNone(detail)
         self.assertEqual(entry["key"], "abc")
+
+    def test_detail_422_has_no_list_specific_hint(self):
+        self.urlopen.side_effect = [http_error(422)]
+        _, error, _ = exporter.get_receipt_detail(TOKEN, {"key": "abc"})
+        self.assertIn("HTTP 422", error)
+        self.assertNotIn("Настройки отображения данных", error)
 
     def test_one_failing_receipt_does_not_stop_others(self):
         def respond(req, timeout):

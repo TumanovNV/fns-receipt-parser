@@ -21,7 +21,6 @@ LIST_URL = f"{BASE}/v1/receipt"
 DETAIL_URL = f"{BASE}/v1/receipt/fiscal_data"
 
 PAGE_SIZE = 10          # exact page size observed in the web app
-MAX_PAGE_SIZE = 100
 REQUEST_DELAY = 0.08    # gentle delay between API calls
 TIMEOUT = 30
 
@@ -29,6 +28,19 @@ MAX_ATTEMPTS = 3        # 1 request + up to 2 retries
 BACKOFF_BASE = 1.0      # seconds between attempts: 1, 2
 MAX_RETRY_AFTER = 30.0  # upper bound for a server-provided Retry-After
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+# The lkdr.nalog.ru web app (main.*.chunk.js) turns every error of
+# POST /v1/receipt into an empty list EXCEPT 422, which it re-throws on the
+# first page and on "load more" alike; the UI then opens the
+# "Настройки отображения данных" dialog (show all receipts for a phone/email
+# identifier or only new ones) and calls /v1/identifiers/receipt_expiration_date.
+# So 422 means "an action is required in the account", not "no receipts":
+# an empty result is a successful response with "receipts": [].
+LIST_422_HINT = (
+    "Сервис требует действия в личном кабинете: откройте https://lkdr.nalog.ru "
+    "в браузере, выберите вариант в окне «Настройки отображения данных», "
+    "если оно появится, и повторите экспорт."
+)
 
 TOKEN_ENV_VAR = "FNS_TOKEN"
 DEFAULT_OUT_DIR = Path("nalog_receipts_export")
@@ -49,7 +61,7 @@ HTTP_STATUS_MESSAGES = {
     403: "Доступ запрещён (HTTP 403). Сессия могла быть завершена "
          "или у token нет доступа к этому ресурсу.",
     404: "Ресурс не найден (HTTP 404). Возможно, API сервиса изменился.",
-    422: "Сервис отклонил параметры запроса (HTTP 422).",
+    422: "Сервис отклонил запрос (HTTP 422).",
     429: "Сервис ограничил частоту запросов (HTTP 429). "
          "Повторите позже или увеличьте --request-delay.",
     500: "Внутренняя ошибка сервиса (HTTP 500).",
@@ -122,17 +134,6 @@ def iso_date(value):
     return value
 
 
-def page_size(value):
-    try:
-        size = int(value)
-    except ValueError:
-        size = 0
-    if not 1 <= size <= MAX_PAGE_SIZE:
-        raise argparse.ArgumentTypeError(
-            f"ожидается целое число от 1 до {MAX_PAGE_SIZE}, получено {value!r}")
-    return size
-
-
 def request_delay(value):
     try:
         delay = float(value)
@@ -176,10 +177,6 @@ def build_parser():
         help="каталог для результатов; создаётся автоматически. "
              "Поддерживаются ~, относительные и абсолютные пути. "
              f"По умолчанию: ./{DEFAULT_OUT_DIR}")
-    parser.add_argument(
-        "--page-size", type=page_size, default=PAGE_SIZE, metavar="N",
-        help=f"сколько чеков запрашивать за одну страницу (1–{MAX_PAGE_SIZE}). "
-             f"По умолчанию {PAGE_SIZE}, как в веб-интерфейсе.")
     parser.add_argument(
         "--request-delay", type=request_delay, default=REQUEST_DELAY,
         metavar="SECONDS",
@@ -243,13 +240,29 @@ def parse_retry_after(value):
     return min(seconds, MAX_RETRY_AFTER)
 
 
+def service_error_text(body):
+    """Short error description from a response body.
+
+    For JSON error objects only "code" and "message" are kept: other fields,
+    such as "additionalInfo" of HTTP 422, may contain the user's phone or email.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body[:500]
+    if not isinstance(data, dict):
+        return body[:500]
+    return " ".join(str(data[k]) for k in ("code", "message") if data.get(k))[:500]
+
+
 def http_error_to_api_error(e, token):
     try:
         body = e.read().decode("utf-8", errors="replace")
     except Exception:
         body = ""
     base = HTTP_STATUS_MESSAGES.get(e.code, f"Ошибка HTTP {e.code}.")
-    message = f"{base} Ответ сервиса: {body[:500]}" if body else base
+    details = service_error_text(body) if body else ""
+    message = f"{base} Ответ сервиса: {details}" if details else base
     retry_after = None
     if e.code == 429 and e.headers is not None:
         retry_after = parse_retry_after(e.headers.get("Retry-After"))
@@ -328,26 +341,22 @@ def build_list_payload(limit, offset, date_from=None, date_to=None):
     }
 
 
-def get_receipts(token, date_from=None, date_to=None,
-                 limit=PAGE_SIZE, delay=REQUEST_DELAY):
+def get_receipts(token, date_from=None, date_to=None, delay=REQUEST_DELAY):
     receipts = []
     seen_keys = set()
     previous_page = None
     offset = 0
 
     while True:
-        payload = build_list_payload(limit, offset, date_from, date_to)
+        payload = build_list_payload(PAGE_SIZE, offset, date_from, date_to)
+        # Every API error is fatal here, 422 included (see LIST_422_HINT), so an
+        # error is never turned into an empty or truncated list.
         try:
             response = request_json(LIST_URL, token, payload)
         except ApiError as e:
-            # The web app treats 422 from this endpoint as "no (more) receipts".
-            # On the first page that is indistinguishable from a rejected
-            # request, so it is only accepted once some receipts were received.
-            if e.status != 422 or offset == 0:
-                raise
-            print(f"\n  Предупреждение: {e} Список считается завершённым.",
-                  file=sys.stderr)
-            break
+            if e.status == 422:
+                raise ApiError(f"{e} {LIST_422_HINT}", status=422) from None
+            raise
 
         page = response.get("receipts", []) if isinstance(response, dict) else None
         if not isinstance(page, list):
@@ -366,10 +375,9 @@ def get_receipts(token, date_from=None, date_to=None,
         receipts.extend(page)
         print(f"  получено: {len(receipts)}", end="\r", flush=True)
 
-        # A page shorter than requested is the last one. min() keeps this safe
-        # if the service silently caps a custom --page-size: pages of at least
-        # PAGE_SIZE (what the web app requests) continue until an empty page.
-        if len(page) < min(limit, PAGE_SIZE):
+        # Like the web app: the next offset is the number of receipts received,
+        # and hasMore == false means there is nothing left to request.
+        if len(page) < PAGE_SIZE or response.get("hasMore") is False:
             break
         offset += len(page)
         time.sleep(delay)
@@ -518,7 +526,7 @@ def run(args):
     print("\n1/3 Получаю список чеков...")
     try:
         receipts = get_receipts(token, args.date_from, args.date_to,
-                                limit=args.page_size, delay=args.request_delay)
+                                delay=args.request_delay)
     except ApiError as e:
         print(f"\nНе удалось получить список чеков. {e}", file=sys.stderr)
         return 1

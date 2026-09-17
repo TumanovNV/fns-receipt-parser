@@ -77,7 +77,6 @@ class ParseArgsTest(unittest.TestCase):
         self.assertIsNone(args.date_from)
         self.assertIsNone(args.date_to)
         self.assertEqual(args.output_dir, Path("nalog_receipts_export"))
-        self.assertEqual(args.page_size, 10)
         self.assertEqual(args.request_delay, 0.08)
 
     def test_valid_dates(self):
@@ -127,15 +126,18 @@ class ParseArgsTest(unittest.TestCase):
             args, _ = parse(["--output-dir", "~/Downloads/fns-receipts"])
         self.assertEqual(args.output_dir, Path("/home/tester/Downloads/fns-receipts"))
 
-    def test_page_size_and_delay_validation(self):
-        args, _ = parse(["--page-size", "25", "--request-delay", "0.5"])
-        self.assertEqual((args.page_size, args.request_delay), (25, 0.5))
-        for argv in (["--page-size", "0"], ["--page-size", "abc"],
-                     ["--page-size", "101"], ["--request-delay", "-1"],
-                     ["--request-delay", "nan"]):
-            with self.subTest(argv=argv):
-                code, _ = parse(argv)
+    def test_request_delay_validation(self):
+        args, _ = parse(["--request-delay", "0.5"])
+        self.assertEqual(args.request_delay, 0.5)
+        for value in ("-1", "61", "nan", "abc"):
+            with self.subTest(value=value):
+                code, _ = parse(["--request-delay", value])
                 self.assertEqual(code, 2)
+
+    def test_page_size_is_not_a_public_option(self):
+        code, err = parse(["--page-size", "25"])
+        self.assertEqual(code, 2)
+        self.assertIn("--page-size", err)
 
     def test_help(self):
         out = io.StringIO()
@@ -143,7 +145,7 @@ class ParseArgsTest(unittest.TestCase):
             exporter.parse_args(["--help"])
         self.assertEqual(ctx.exception.code, 0)
         for option in ("--date-from", "--date-to", "--output-dir",
-                       "--page-size", "--request-delay", "FNS_TOKEN"):
+                       "--request-delay", "FNS_TOKEN"):
             self.assertIn(option, out.getvalue())
 
 
